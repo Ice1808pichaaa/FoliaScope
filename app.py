@@ -23,12 +23,22 @@ from folia_agent.agent import (
 
 load_dotenv()
 
+def get_config(name: str, default: str | None = None):
+    if name in st.secrets:
+        return st.secrets[name]
+    return os.getenv(name, default)
+
+GOOGLE_API_KEY = get_config("GOOGLE_API_KEY")
+OPENWEATHER_API_KEY = get_config("OPENWEATHER_API_KEY")
+GCP_PROJECT_ID = get_config("GCP_PROJECT_ID")
+GCP_LOCATION = get_config("GCP_LOCATION", "us-central1")
+
+
+load_dotenv()
+
 APP_NAME = "Folia Forecaster"
 USER_ID = "user-1"
 SESSION_ID = "session-1"
-
-GCP_PROJECT = os.environ.get("GCP_PROJECT", "gen-lang-client-0912717065")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
 
 try:
     vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
