@@ -3,51 +3,70 @@ import io
 import json
 import asyncio
 import base64
-from types import SimpleNamespace
 import re
+from types import SimpleNamespace
+from pathlib import Path
+
 import streamlit as st
 from PIL import Image
 from dotenv import load_dotenv
+
 import vertexai
 from google.api_core.exceptions import ResourceExhausted, PermissionDenied, NotFound
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 import google.generativeai as genai
 
-
+# --- your agent/tools ---
 from folia_agent.agent import (
     folia_agent,
     generate_video_forecast as _agent_generate_video_forecast,
-    get_weather_forecast,  
+    get_weather_forecast,
 )
 
+# -------------------------------------------------
+# 1) load local .env (for local dev)
+# -------------------------------------------------
 load_dotenv()
 
+
+# -------------------------------------------------
+# 2) helper to read from Streamlit secrets first,
+#    then fall back to env/.env
+# -------------------------------------------------
 def get_config(name: str, default: str | None = None):
     if name in st.secrets:
         return st.secrets[name]
     return os.getenv(name, default)
+
 
 GOOGLE_API_KEY = get_config("GOOGLE_API_KEY")
 OPENWEATHER_API_KEY = get_config("OPENWEATHER_API_KEY")
 GCP_PROJECT_ID = get_config("GCP_PROJECT_ID")
 GCP_LOCATION = get_config("GCP_LOCATION", "us-central1")
 
-
-load_dotenv()
-
 APP_NAME = "Folia Forecaster"
 USER_ID = "user-1"
 SESSION_ID = "session-1"
 
+# -------------------------------------------------
+# 3) init Vertex AI if we have project/location
+# -------------------------------------------------
 try:
-    vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-    print(f"[app] Vertex AI initialized for project={GCP_PROJECT}, location={GCP_LOCATION}")
+    if GCP_PROJECT_ID:
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
+        print(f"[app] Vertex AI initialized for project={GCP_PROJECT_ID}, location={GCP_LOCATION}")
+    else:
+        print("[app] WARN: GCP_PROJECT_ID not set, skipping vertexai.init()")
 except Exception as e:
     print("[app] WARN: could not init Vertex AI:", e)
 
+# -------------------------------------------------
+# 4) ADK session/runner
+# -------------------------------------------------
 SESSION_SERVICE = InMemorySessionService()
 RUNNER = Runner(agent=folia_agent, session_service=SESSION_SERVICE, app_name=APP_NAME)
+
 
 async def _ensure_session():
     try:
@@ -55,28 +74,37 @@ async def _ensure_session():
             app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID, state={}
         )
     except Exception:
+        # ok if already created
         pass
 
+
+# create session once at import time
 asyncio.run(_ensure_session())
 
-
+# -------------------------------------------------
+# 5) direct Gemini (fallback) init
+#    --> use the same config helper
+# -------------------------------------------------
 GENAI_MODEL = None
-_genai_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-if _genai_key:
+if GOOGLE_API_KEY:
     try:
-        genai.configure(api_key=_genai_key)
+        genai.configure(api_key=GOOGLE_API_KEY)
         GENAI_MODEL = genai.GenerativeModel("gemini-2.5-flash")
         print("[app] Direct GENAI_MODEL initialized.")
     except Exception as e:
         print("[app] ERROR initializing direct GEMINI:", e)
         GENAI_MODEL = None
+else:
+    print("[app] WARN: no GOOGLE_API_KEY found in secrets/env")
 
-
-
+# -------------------------------------------------
+# 6) classification + helpers
+# -------------------------------------------------
 SPECIES_LABELS = [
     "maple", "oak", "ginkgo", "sweetgum", "birch",
-    "beech", "cherry", "poplar", "aspen", "hickory", "elm"
+    "beech", "cherry", "poplar", "aspen", "hickory", "elm",
 ]
+
 
 def _to_text_from_adk_response(resp) -> str | None:
     try:
@@ -101,6 +129,7 @@ def _to_text_from_adk_response(resp) -> str | None:
     except Exception:
         return None
 
+
 def _image_to_inline_part(image: Image.Image) -> dict:
     if image.mode not in ("RGB", "RGBA"):
         image = image.convert("RGB")
@@ -108,6 +137,7 @@ def _image_to_inline_part(image: Image.Image) -> dict:
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=90)
     return {"inline_data": {"mime_type": "image/jpeg", "data": buf.getvalue()}}
+
 
 def _classify_species_with_gemini(image: Image.Image) -> str | None:
     """One-word fallback species classifier (used only if agent gives 'unknown')."""
@@ -118,12 +148,15 @@ def _classify_species_with_gemini(image: Image.Image) -> str | None:
         prompt = (
             "Identify the dominant tree species in this photo. "
             "Reply ONLY with one word from this set: "
-            + ", ".join(SPECIES_LABELS) +
-            ". If you truly cannot tell, reply 'unknown'."
+            + ", ".join(SPECIES_LABELS)
+            + ". If you truly cannot tell, reply 'unknown'."
         )
         resp = GENAI_MODEL.generate_content(
             contents=[{"role": "user", "parts": [{"text": prompt}, part]}],
-            generation_config={"response_mime_type": "text/plain", "temperature": 0.2},
+            generation_config={
+                "response_mime_type": "text/plain",
+                "temperature": 0.2,
+            },
         )
         guess = (getattr(resp, "text", "") or "").strip().lower()
         guess = re.sub(r"[^a-z]", "", guess)
@@ -133,8 +166,8 @@ def _classify_species_with_gemini(image: Image.Image) -> str | None:
     except Exception:
         return None
 
+
 def _strip_dup_prefix(s: str) -> str:
-    """If a line is 'Day 1: Day 1: ...', collapse to single 'Day 1: ...'."""
     if not isinstance(s, str):
         return str(s)
     parts = s.split(":", 1)
@@ -146,14 +179,8 @@ def _strip_dup_prefix(s: str) -> str:
                 return f"{parts[0]}:{second[1]}"
     return s
 
+
 def _format_weather_lines(weather_days: list[str]) -> list[str]:
-    """
-    Normalize the weather lines so we show exactly:
-      Day 1 (Tomorrow): <desc>
-      Day 2: <desc>
-      Day 3: <desc>
-    without any duplicated 'Day X:' prefixes.
-    """
     lines = []
     for idx, day in enumerate(weather_days, start=1):
         clean = _strip_dup_prefix(str(day))
@@ -167,8 +194,8 @@ def _format_weather_lines(weather_days: list[str]) -> list[str]:
             lines.append(f"Day {idx}: {desc}")
     return lines
 
+
 def _format_final_answer(parsed: dict) -> dict:
-    """Build the final human-readable answer and ensure a video prompt."""
     tree = (parsed.get("tree_species") or "fall").strip().lower()
     days_left = parsed.get("estimated_days_color_will_last")
     changed_date = parsed.get("estimated_color_change_date")
@@ -217,13 +244,8 @@ def _format_final_answer(parsed: dict) -> dict:
     parsed["video_prompt"] = vp
     return parsed
 
+
 def _to_valid_payload(raw_text: str | None) -> dict | None:
-    """
-    Normalize the model's JSON into a compact, human-readable answer.
-    Expected JSON keys from the model:
-      - tree_species, estimated_days_color_will_last, estimated_color_change_date,
-        weather_days, weather_critical, video_prompt.
-    """
     if not raw_text:
         return None
 
@@ -257,21 +279,20 @@ def _to_valid_payload(raw_text: str | None) -> dict | None:
     if not isinstance(parsed, dict):
         return {
             "final_answer": "Model did not return JSON, so I cannot confirm it used the weather API.",
-            "video_prompt": "Time-lapse of the uploaded fall tree."
+            "video_prompt": "Time-lapse of the uploaded fall tree.",
         }
 
-
-    tree          = parsed.get("tree_species")
-    days_left     = parsed.get("estimated_days_color_will_last")
-    changed_date  = parsed.get("estimated_color_change_date")
-    weather_days  = parsed.get("weather_days")
-    critical      = parsed.get("weather_critical")
-    video_prompt  = parsed.get("video_prompt")
+    tree = parsed.get("tree_species")
+    days_left = parsed.get("estimated_days_color_will_last")
+    changed_date = parsed.get("estimated_color_change_date")
+    weather_days = parsed.get("weather_days")
+    critical = parsed.get("weather_critical")
+    video_prompt = parsed.get("video_prompt")
 
     if not isinstance(weather_days, list) or len(weather_days) == 0:
         return {
             "final_answer": "Weather API data was not available in the model response, so I cannot give a reliable foliage estimate.",
-            "video_prompt": "Time-lapse of the uploaded fall tree."
+            "video_prompt": "Time-lapse of the uploaded fall tree.",
         }
 
     parsed.setdefault("tree_species", (tree or "unknown"))
@@ -282,10 +303,8 @@ def _to_valid_payload(raw_text: str | None) -> dict | None:
 
     return _format_final_answer(parsed)
 
+
 def _inject_real_weather_and_finalize(result: dict, location: str, image: Image.Image | None = None) -> dict:
-    """
-    Ensure species + weather + duration are set, then produce final text.
-    """
     if not result or not isinstance(result, dict):
         return result
 
@@ -294,7 +313,6 @@ def _inject_real_weather_and_finalize(result: dict, location: str, image: Image.
         species_guess = _classify_species_with_gemini(image)
         if species_guess:
             result["tree_species"] = species_guess
-
 
     if not result.get("weather_days"):
         wf = get_weather_forecast(location)
@@ -316,8 +334,8 @@ def _inject_real_weather_and_finalize(result: dict, location: str, image: Image.
 
     return _format_final_answer(result)
 
+
 def direct_gemini_forecast(question: str, location: str, image: Image.Image) -> dict | None:
-    """Direct Gemini fallback (schema-constrained; no fabricated weather)."""
     if GENAI_MODEL is None:
         return {"final_answer": "Error: Direct Gemini model is not initialized.", "video_prompt": None}
 
@@ -336,9 +354,16 @@ def direct_gemini_forecast(question: str, location: str, image: Image.Image) -> 
         "Do NOT include extra text. Do not fabricate weather."
     )
     contents = [
-        {"role": "user",
-         "parts": [{"text": schema_prompt + f"\n\nUser question: {question}\nLocation: {location}"},
-                   image_part]}]
+        {
+            "role": "user",
+            "parts": [
+                {
+                    "text": schema_prompt + f"\n\nUser question: {question}\nLocation: {location}"
+                },
+                image_part,
+            ],
+        }
+    ]
 
     try:
         resp = GENAI_MODEL.generate_content(
@@ -350,8 +375,8 @@ def direct_gemini_forecast(question: str, location: str, image: Image.Image) -> 
     except Exception as e:
         return {"final_answer": f"Error during Gemini fallback: {e}", "video_prompt": None}
 
+
 async def run_agent_main(question: str, location: str, image: Image.Image):
-    """Run the ADK agent and collect the final text or partial JSON."""
     image_part = _image_to_inline_part(image)
     new_message = SimpleNamespace(
         role="user",
@@ -361,9 +386,7 @@ async def run_agent_main(question: str, location: str, image: Image.Image):
     raw_text, last_raw_obj = None, None
     debug_events, errors = [], []
 
-    async for event in RUNNER.run_async(
-        user_id=USER_ID, session_id=SESSION_ID, new_message=new_message
-    ):
+    async for event in RUNNER.run_async(user_id=USER_ID, session_id=SESSION_ID, new_message=new_message):
         delta = getattr(event, "delta", None)
         if delta:
             piece = _to_text_from_adk_response(delta)
@@ -387,6 +410,7 @@ async def run_agent_main(question: str, location: str, image: Image.Image):
     debug = {"raw_text": raw_text, "errors": errors, "events": debug_events[:10]}
     return payload, debug
 
+
 def safe_generate_video_forecast(prompt: str, image: Image.Image):
     try:
         return _agent_generate_video_forecast(prompt, image)
@@ -398,11 +422,12 @@ def safe_generate_video_forecast(prompt: str, image: Image.Image):
         return None
 
 
-
+# =========================================================
+# STREAMLIT UI
+# =========================================================
 st.set_page_config(page_title=APP_NAME, page_icon="🍁", layout="wide")
 
 st.title("🍁 FoliaScope")
-
 st.markdown(
     """
 **What this app does**
@@ -419,7 +444,6 @@ st.markdown("Upload a photo **or use your camera**")
 question = "How long will this color last?"
 location = st.text_input("Where did you take this photo?", "Atlanta, Georgia", key="location_val")
 
-from pathlib import Path
 
 def _find_sample_dir() -> Path | None:
     here = Path(__file__).resolve().parent
@@ -433,6 +457,7 @@ def _find_sample_dir() -> Path | None:
         if p.is_dir():
             return p
     return None
+
 
 SAMPLE_DIR = _find_sample_dir()
 exts = {".jpg", ".jpeg", ".png", ".heic", ".webp"}
@@ -465,20 +490,17 @@ with tab_samples:
     with st.expander("Browse sample images"):
         if len(sample_img) > 1:
             keys = [k for k in sample_img.keys() if k != "<None>"]
-            rows = [keys[:4], keys[4:8]]
             st.write("**Preview**")
-            for row in rows:
-                c1, c2, c3, c4 = st.columns(4)
-                cols = [c1, c2, c3, c4]
-                for col, key in zip(cols, row):
-                    with col:
-                        try:
-                            st.image(sample_img[key], caption=key, width= "stretch")
-                        except Exception:
-                            st.caption(f"(unable to preview {key})")
+            # keep simple to avoid layout errors
+            for key in keys:
+                try:
+                    st.image(sample_img[key], caption=key, use_column_width=True)
+                except Exception:
+                    st.caption(f"(unable to preview {key})")
         else:
             st.info("No sample images found in `folia_agent/img` or `img`.")
 
+# pick image from 3 sources
 image, src_label = None, None
 try:
     if camera_file is not None:
@@ -497,7 +519,7 @@ except Exception:
 if image is not None and question and location:
     col1, col2 = st.columns(2)
     with col1:
-        st.image(image, caption=src_label, width= "stretch")
+        st.image(image, caption=src_label, use_column_width=True)
     with col2:
         if st.button("Generate Forecast", type="primary"):
             try:
@@ -505,6 +527,7 @@ if image is not None and question and location:
                     try:
                         payload, debug = asyncio.run(run_agent_main(question, location, image))
                     except RuntimeError:
+                        # streamlit sometimes already has an event loop
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         payload, debug = loop.run_until_complete(run_agent_main(question, location, image))
@@ -542,7 +565,6 @@ if image is not None and question and location:
                             st.info("No video produced (preview / quota issue).")
                     else:
                         st.info("No video prompt produced by the agent.")
-                        
             except Exception as e:
                 st.error(f"An error occurred: {e}")
                 st.exception(e)
