@@ -17,23 +17,15 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 import google.generativeai as genai
 
-# --- your agent/tools ---
 from folia_agent.agent import (
     folia_agent,
     generate_video_forecast as _agent_generate_video_forecast,
     get_weather_forecast,
 )
 
-# -------------------------------------------------
-# 1) load local .env (for local dev)
-# -------------------------------------------------
 load_dotenv()
 
 
-# -------------------------------------------------
-# 2) helper to read from Streamlit secrets first,
-#    then fall back to env/.env
-# -------------------------------------------------
 def get_config(name: str, default: str | None = None):
     if name in st.secrets:
         return st.secrets[name]
@@ -49,9 +41,7 @@ APP_NAME = "Folia Forecaster"
 USER_ID = "user-1"
 SESSION_ID = "session-1"
 
-# -------------------------------------------------
-# 3) init Vertex AI if we have project/location
-# -------------------------------------------------
+
 try:
     if GCP_PROJECT_ID:
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
@@ -61,9 +51,7 @@ try:
 except Exception as e:
     print("[app] WARN: could not init Vertex AI:", e)
 
-# -------------------------------------------------
-# 4) ADK session/runner
-# -------------------------------------------------
+
 SESSION_SERVICE = InMemorySessionService()
 RUNNER = Runner(agent=folia_agent, session_service=SESSION_SERVICE, app_name=APP_NAME)
 
@@ -74,17 +62,11 @@ async def _ensure_session():
             app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID, state={}
         )
     except Exception:
-        # ok if already created
         pass
 
 
-# create session once at import time
 asyncio.run(_ensure_session())
 
-# -------------------------------------------------
-# 5) direct Gemini (fallback) init
-#    --> use the same config helper
-# -------------------------------------------------
 GENAI_MODEL = None
 if GOOGLE_API_KEY:
     try:
@@ -97,9 +79,6 @@ if GOOGLE_API_KEY:
 else:
     print("[app] WARN: no GOOGLE_API_KEY found in secrets/env")
 
-# -------------------------------------------------
-# 6) classification + helpers
-# -------------------------------------------------
 SPECIES_LABELS = [
     "maple", "oak", "ginkgo", "sweetgum", "birch",
     "beech", "cherry", "poplar", "aspen", "hickory", "elm",
@@ -491,7 +470,6 @@ with tab_samples:
         if len(sample_img) > 1:
             keys = [k for k in sample_img.keys() if k != "<None>"]
             st.write("**Preview**")
-            # keep simple to avoid layout errors
             for key in keys:
                 try:
                     st.image(sample_img[key], caption=key, use_column_width=True)
@@ -500,7 +478,6 @@ with tab_samples:
         else:
             st.info("No sample images found in `folia_agent/img` or `img`.")
 
-# pick image from 3 sources
 image, src_label = None, None
 try:
     if camera_file is not None:
@@ -527,7 +504,6 @@ if image is not None and question and location:
                     try:
                         payload, debug = asyncio.run(run_agent_main(question, location, image))
                     except RuntimeError:
-                        # streamlit sometimes already has an event loop
                         loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(loop)
                         payload, debug = loop.run_until_complete(run_agent_main(question, location, image))
